@@ -5,6 +5,8 @@ __cache__/
 champions.json
 items.json
 .vscode/
+# HM: local scrape run logs
+scrape-*.log
 .env
 .venv
 env/

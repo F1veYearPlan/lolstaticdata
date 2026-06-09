@@ -268,7 +268,15 @@ class LolWikiDataHandler:
             ):  # Champion not released yet
                 print(f"INFO: Skipping unreleased champion {name}")
                 continue
-            champion = self._render_champion_data(name, d)
+            try:
+                champion = self._render_champion_data(name, d)
+            except Exception as e:
+                # SKIP-AND-WARN (HM instrumentation): one champion that fails to
+                # parse must not abort the entire scrape. Log it with the name +
+                # error and continue, so a single run captures the FULL failure
+                # surface plus every champion that parses cleanly.
+                print(f"SKIP-AND-WARN: champion '{name}' failed to parse: {type(e).__name__}: {e}")
+                continue
             yield champion
             if self.target_champion:
                 return
@@ -611,7 +619,12 @@ class LolWikiDataHandler:
 
             recharge_rate = data.get("recharge")
             if recharge_rate:
-                _, recharge_rate = ParsingAndRegex.regex_simple_flat(recharge_rate, nvalues)  # ignore units
+                try:
+                    _, recharge_rate = ParsingAndRegex.regex_simple_flat(recharge_rate, nvalues)  # ignore units
+                except Exception as error:
+                    print(f"ERROR: FAILURE TO PARSE RECHARGE: {recharge_rate!r}")
+                    print("ERROR:", error)
+                    recharge_rate = None
 
             effects = []
             for ending in ["", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]:
@@ -701,9 +714,15 @@ class LolWikiDataHandler:
         initial_split = list(grouper(initial_split, 2))
 
         for attribute, data in initial_split:
-            if attribute.endswith(":"):
-                attribute = attribute[:-1]
-            result = self._render_leveling(attribute, data, nvalues)
+            try:
+                if attribute is not None and attribute.endswith(":"):
+                    attribute = attribute[:-1]
+                result = self._render_leveling(attribute, data, nvalues)
+            except Exception as error:
+                # Row-level skip-and-warn: one malformed leveling row must not
+                # drop the whole ability/champion. Log and continue.
+                print(f"ERROR: FAILURE TO PARSE LEVELING ROW '{attribute}': {error}")
+                continue
             results.append(result)
 
         return results
@@ -732,9 +751,10 @@ class LolWikiDataHandler:
             except Exception as error:
                 print(f"ERROR: FAILURE TO PARSE MODIFIER:  {lvling}")
                 print("ERROR:", error)
+                n = ParsingAndRegex.resolve_nvalues(nvalues, lvling)
                 modifier = Modifier(
-                    values=[0 for _ in range(nvalues)],
-                    units=[lvling for _ in range(nvalues)],
+                    values=[0 for _ in range(n)],
+                    units=[lvling for _ in range(n)],
                 )
                 modifiers.append(modifier)
         return modifiers
@@ -1027,6 +1047,18 @@ class ParsingAndRegex:
         return values
 
     @staticmethod
+    def resolve_nvalues(nvalues, string: str = "") -> int:
+        # `nvalues=None` is the scraper's own "auto-detect rank count" signal
+        # (used for variable-rank champions like Heimerdinger/Sona/Karma/Nidalee).
+        # The main branch of regex_simple_flat already infers it as len(numbers);
+        # mirror that wherever we build a fixed-length array so a None never
+        # reaches range() — that raised TypeError and dropped the whole champion.
+        if nvalues is not None:
+            return nvalues
+        n = len(ParsingAndRegex.rc_number.findall(string))
+        return n if n > 0 else 1
+
+    @staticmethod
     def regex_simple_flat(string: str, nvalues: int) -> Tuple[List[str], List[Union[int, float]]]:
         numbers = ParsingAndRegex.rc_number.findall(string)
         if "/" in string:
@@ -1061,7 +1093,7 @@ class ParsingAndRegex:
             assert len(values) == nvalues
             return not_parsed, values
         elif string.lower() == "none":
-            values = [0 for _ in range(nvalues)]
+            values = [0 for _ in range(ParsingAndRegex.resolve_nvalues(nvalues, string))]
             return ["", ""], values # No cost abilities
         raise UnparsableLeveling(f"Could not parse a simple flat value: {string}")
 
@@ -1077,8 +1109,9 @@ class ParsingAndRegex:
         if mod in list(LolWikiDataHandler.UNHANDLED_MODIFIERS.keys()):
             value = LolWikiDataHandler.UNHANDLED_MODIFIERS[mod]["value"]
             lvling = LolWikiDataHandler.UNHANDLED_MODIFIERS[mod]["lvling"]
-            parsed = [value for _ in range(nvalues)]
-            units = [lvling for _ in range(nvalues)]
+            n = ParsingAndRegex.resolve_nvalues(nvalues, mod)
+            parsed = [value for _ in range(n)]
+            units = [lvling for _ in range(n)]
             return units, parsed
         else:
             units, parsed = ParsingAndRegex.regex_simple_flat(mod, nvalues)
