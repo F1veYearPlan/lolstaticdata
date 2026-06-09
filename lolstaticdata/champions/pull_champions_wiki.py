@@ -60,6 +60,14 @@ class UnparsableLeveling(Exception):
     pass
 
 
+class SkipModifier(Exception):
+    """Signals a dynamic / non-rank modifier (scales with stacks, charge time,
+    crit chance, resistances, or a U+2022-joined multi-quantity value) that must
+    be OMITTED rather than parsed into a per-rank array or zeroed. A missing
+    value beats a fabricated/wrong one."""
+    pass
+
+
 class HTMLAbilityWrapper:
     def __init__(self, soup):
         self.soup = soup
@@ -125,26 +133,10 @@ class LolWikiDataHandler:
             "value": 3,
             "lvling": "% per 1% of health lost in the past 4 seconds"
         },
-        # Kog'Maw
-        "40 : 400 (based on stacks)": {
-            "value": 40,
-            "lvling": " + 40 for every stack, capped at 9 stacks"
-        },
-        # K'Sante
-        "3.5 : 2 (based on bonus resistances)": {
-            "value": 3.5,
-            "lvling": " - 0.0125 x bonus resistances, " \
-            "capped at 120 bonus resistances"
-        },
         # Nasus
         "Siphoning Strike Stacks": {
             "value": 0,
             "lvling": "Siphoning Strike Stacks"
-        },
-        # Quinn
-        "8 : 2.93 (based on critical strike chance)": {
-            "value": 8,
-            "lvling": " x (0.99 ^ critical strike chance %)"
         },
         # Sett
         "1% (+ 1 / 1.5 / 2 / 2.5 / 3% per 100 AD) " \
@@ -158,27 +150,10 @@ class LolWikiDataHandler:
             "lvling": "% (+ 2 / 3 / 4 / 5 / 6% per 100 AD) " \
             "of target's maximum health"
         },
-        # Veigar
-        "8 : 0 (based on  Phenomenal Evil stacks)": {
-            "value": 8,
-            "lvling": " x (0.9 ^ (Phenominal Evil Stacks / 50))"
-        },
         # Vi
         "[ 1% per 35 ][ 2.86% per 100 ]bonus AD": {
             "value": 2.86,
             "lvling": "% per 100 bonus AD"
-        },
-        # Yasuo/Yone
-        "4 : 1.33 (based on bonus attack speed)": {
-            "value": 4,
-            "lvling": " x (1 - (0.01 per 1.67% bonus attack speed)). " \
-            "This is capped at 67% reduction at 111.1% bonus attack speed."
-        },
-        # Yone
-        "14 : 6 (based on bonus attack speed)": {
-            "value": 14,
-            "lvling": " x (1 - (0.01 per 1.51% bonus attack speed)). " \
-            "This is capped at 62.5% reduction at 94.6% bonus attack speed."
         },
     }
 
@@ -621,6 +596,8 @@ class LolWikiDataHandler:
             if recharge_rate:
                 try:
                     _, recharge_rate = ParsingAndRegex.regex_simple_flat(recharge_rate, nvalues)  # ignore units
+                except SkipModifier:
+                    recharge_rate = None
                 except Exception as error:
                     print(f"ERROR: FAILURE TO PARSE RECHARGE: {recharge_rate!r}")
                     print("ERROR:", error)
@@ -700,16 +677,19 @@ class LolWikiDataHandler:
 
         # Let's parse!
         initial_split = levelings.split("\n")
+        # Drop orphan "<Ability> scales with <X> rank" note lines (Heimerdinger's
+        # UPGRADE!!!-scaled variants, Nidalee's Cougar forms): they carry no value
+        # row, so leaving them in shifts the 2-by-2 (attribute, value) pairing
+        # below and pushes a label into a value slot.
+        # (The Cougar "… rank up when … does" note is matched explicitly since it
+        # ends in "does", not "rank".)
+        _cougar_note = "Cougar form's abilities rank up when Aspect of the Cougar does"
         initial_split = [
-            lvling.strip()
-            for lvling in initial_split
-            if lvling.strip()
-            not in (
-                "Takedown scales with Aspect of the Cougar's rank",
-                "Swipe scales with Aspect of the Cougar's rank",
-                "Pounce scales with Aspect of the Cougar's rank",
-                "Cougar form's abilities rank up when Aspect of the Cougar does",
-            )
+            s
+            for s in (lvling.strip() for lvling in initial_split)
+            if s
+            and s != _cougar_note
+            and not ("scales with" in s and s.endswith("rank"))
         ]
         initial_split = list(grouper(initial_split, 2))
 
@@ -748,6 +728,11 @@ class LolWikiDataHandler:
             try:
                 modifier = self._render_modifier(lvling, nvalues)
                 modifiers.append(modifier)
+            except SkipModifier as skip:
+                # Dynamic / non-rank value — omit it (don't fabricate per-rank
+                # numbers, don't emit a zeroed placeholder).
+                print(f"  SKIP (dynamic/non-rank): {skip}")
+                continue
             except Exception as error:
                 print(f"ERROR: FAILURE TO PARSE MODIFIER:  {lvling}")
                 print("ERROR:", error)
@@ -1019,6 +1004,14 @@ class ParsingAndRegex:
     rc_number = re.compile(r_number)
     rc_based_on_level = re.compile(r"(\d+\.?\d*) ?[−|:] ?(\d+\.?\d*) \(based on level\)")
     rc_based_on_crit = re.compile(r"\d+ \+ \d+% critical strike chance")
+    # "(based on X)" where X is NOT "level" → a dynamic, non-rank value (chimes,
+    # charge time, crit chance, resistances, stacks, …). "(based on level)" is
+    # the one allowed exception (genuinely per-level; interpolated separately).
+    rc_dynamic_scaling = re.compile(r"\(based on (?!level\))")
+    # Crit-damage rows render as "<base> + (A% + B%) STAT" (an AD ratio + its
+    # Infinity-Edge bonus, sharing one trailing stat). Normalized to the standard
+    # "(+ A% STAT) (+ B% STAT)" scaling form before parsing.
+    rc_crit_scaling = re.compile(r"\+\s*\((\d+(?:\.\d+)?%)\s*\+\s*(\d+(?:\.\d+)?%)\)\s*([A-Za-z]+(?: [A-Za-z]+)?)\s*$")
 
     @staticmethod
     def regex_slash_separated(string: str, nvalues: int) -> Tuple[List[str], List[Union[int, float]]]:
@@ -1061,6 +1054,13 @@ class ParsingAndRegex:
     @staticmethod
     def regex_simple_flat(string: str, nvalues: int) -> Tuple[List[str], List[Union[int, float]]]:
         numbers = ParsingAndRegex.rc_number.findall(string)
+        # Dynamic / non-rank values are not a function of ability rank — skip
+        # them cleanly rather than fabricate a per-rank array. Checked BEFORE the
+        # "/" branch so e.g. Vladimir's charge-time "2% / 4% / 6% / 8%" cost is
+        # not read as ranks. A U+2022 bullet joins multi-quantity / base-vs-alt-
+        # form values (charge costs, K'Sante cooldowns).
+        if "•" in string or ParsingAndRegex.rc_dynamic_scaling.search(string):
+            raise SkipModifier(string)
         if "/" in string:
             return ParsingAndRegex.regex_slash_separated(string, nvalues)
         elif len(ParsingAndRegex.rc_based_on_level.findall(string)) > 0:
@@ -1100,7 +1100,12 @@ class ParsingAndRegex:
     @staticmethod
     def get_units(not_parsed: List[str]) -> str:
         assert len(not_parsed) == 2
-        assert not_parsed[0] == ""
+        if not_parsed[0] != "":
+            # The number was wrapped/prefixed rather than leading the string —
+            # e.g. Aurelion Sol's "(3.1% Stardust)% of target's maximum health",
+            # a dynamic resource scaling. The unit can't be cleanly extracted and
+            # the value isn't a clean per-rank number → skip it.
+            raise SkipModifier("".join(not_parsed))
         return not_parsed[1]
 
     @staticmethod
@@ -1120,7 +1125,22 @@ class ParsingAndRegex:
             return units, parsed
 
     @staticmethod
+    def normalize_crit_scaling(mods: str) -> str:
+        # Crit-damage rows render as "<base> + (A% + B%) STAT" (e.g. Yasuo
+        # "20 / 45 / 70 / 95 / 120 + (189% + 28.35%) AD" — the AD ratio plus its
+        # Infinity-Edge bonus, sharing one trailing stat). The naive " + " split
+        # in split_modifiers would tear the parenthetical apart. Rewrite to the
+        # scraper's standard "<base> (+ A% STAT) (+ B% STAT)" so the proven
+        # (+ …) scaling path emits two clean ratios. Gated on a slash-separated
+        # base (every crit row has per-rank base damage) so the rewrite can't
+        # touch a non-crit row that happens to share the arithmetic shape.
+        if "/" not in mods:
+            return mods
+        return ParsingAndRegex.rc_crit_scaling.sub(r"(+ \1 \3) (+ \2 \3)", mods)
+
+    @staticmethod
     def split_modifiers(mods: str) -> List[str]:
+        mods = ParsingAndRegex.normalize_crit_scaling(mods)
         flat, scalings = ParsingAndRegex.get_scalings(mods)
         if " + " in flat:
             flat = flat.split(" + ")
