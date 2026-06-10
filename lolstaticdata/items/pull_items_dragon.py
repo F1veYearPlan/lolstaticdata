@@ -28,11 +28,16 @@ class DragonItem:
 
     @staticmethod
     def get_item_plaintext(item):
-        url = f"https://raw.communitydragon.org/{DragonItem.version}/game/en_us/data/menu/en_us/lol.stringtable.json"
-        j = download_json(url, use_cache=True)
+        # Use `latest` (like get_cdragon's item list) — CDragon does NOT keep a
+        # per-patch stringtable snapshot, so the `{major}.{minor}` path 404s right
+        # after a new patch drops and returns non-JSON. The plaintext is a minor
+        # short-description field, so a fetch failure degrades to None instead of
+        # crashing / skipping the whole item.
+        url = "https://raw.communitydragon.org/latest/game/en_us/data/menu/en_us/lol.stringtable.json"
         try:
-            return j['entries']["game_item_plaintext_" + str(item)]
-        except:
+            j = download_json(url, use_cache=True)
+            return j["entries"]["game_item_plaintext_" + str(item)]
+        except Exception:
             return None
 
     @classmethod
@@ -87,9 +92,7 @@ class DragonItem:
                 path = path.split("ASSETS")[1]
                 path = path.lower()
                 path = (
-                    "https://raw.communitydragon.org/{}/plugins/rcp-be-lol-game-data/global/default/assets".format(
-                        DragonItem.version
-                    )
+                    "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/assets"
                     + path
                 )
                 return path
